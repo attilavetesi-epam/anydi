@@ -3107,41 +3107,65 @@ class TestContainerCustomScopes:
             async with container.ascoped_context("unknown"):
                 pass
 
-    def test_scoped_context_reentry_same_scope(self, container: Container) -> None:
-        """Test that re-entering the same scoped context reuses existing context."""
+    def test_scoped_context_reentry_reuses_context(self, container: Container) -> None:
+        """Test that re-entering a scope reuses existing context by default."""
         container.register_scope("task")
         container.register(UniqueId, scope="task")  # type: ignore[arg-type]
 
         with container.scoped_context("task") as ctx1:
             instance1 = container.resolve(UniqueId)
 
-            # Re-enter the same scope
             with container.scoped_context("task") as ctx2:
                 instance2 = container.resolve(UniqueId)
 
-                # Should be the same context
                 assert ctx1 is ctx2
-                # Should be the same instance
                 assert instance1 is instance2
 
-    async def test_ascoped_context_reentry_same_scope(
+    def test_scoped_context_reentry_raises_when_forbidden(
         self, container: Container
     ) -> None:
-        """Test re-entering same async scoped context reuses existing context."""
+        """Re-entering a scope with reentry='forbid' raises RuntimeError."""
+        container.register_scope("task")
+        container.register(UniqueId, scope="task")  # type: ignore[arg-type]
+
+        with container.scoped_context("task"):
+            with pytest.raises(
+                RuntimeError,
+                match=r"re-entry is forbidden",
+            ):
+                with container.scoped_context("task", reentry="forbid"):
+                    pass
+
+    async def test_ascoped_context_reentry_reuses_context(
+        self, container: Container
+    ) -> None:
+        """Test that async re-entering a scope reuses existing context by default."""
         container.register_scope("task")
         container.register(UniqueId, scope="task")  # type: ignore[arg-type]
 
         async with container.ascoped_context("task") as ctx1:
             instance1 = await container.aresolve(UniqueId)
 
-            # Re-enter the same scope
             async with container.ascoped_context("task") as ctx2:
                 instance2 = await container.aresolve(UniqueId)
 
-                # Should be the same context
                 assert ctx1 is ctx2
-                # Should be the same instance
                 assert instance1 is instance2
+
+    async def test_ascoped_context_reentry_raises_when_forbidden(
+        self, container: Container
+    ) -> None:
+        """Test that async re-entering with reentry='forbid' raises RuntimeError."""
+        container.register_scope("task")
+        container.register(UniqueId, scope="task")  # type: ignore[arg-type]
+
+        async with container.ascoped_context("task"):
+            with pytest.raises(
+                RuntimeError,
+                match=r"re-entry is forbidden",
+            ):
+                async with container.ascoped_context("task", reentry="forbid"):
+                    pass
 
     def test_singleton_context_reentry(self, container: Container) -> None:
         """Test that re-entering the singleton context works correctly."""
@@ -3171,20 +3195,17 @@ class TestContainerCustomScopes:
                 # Should be the same instance
                 assert instance1 is instance2
 
-    def test_request_context_reentry(self, container: Container) -> None:
+    def test_request_context_reentry_reuses_context(self, container: Container) -> None:
         """Test that re-entering the request context reuses existing context."""
         container.register(UniqueId, scope="request")
 
         with container.request_context() as ctx1:
             instance1 = container.resolve(UniqueId)
 
-            # Re-enter the request context
             with container.request_context() as ctx2:
                 instance2 = container.resolve(UniqueId)
 
-                # Should be the same context (request_context calls scoped_context)
                 assert ctx1 is ctx2
-                # Should be the same instance
                 assert instance1 is instance2
 
     def test_get_context_scopes_default(self, container: Container) -> None:

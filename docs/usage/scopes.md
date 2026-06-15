@@ -255,6 +255,46 @@ async def process_workflow() -> None:
             # Process workflow...
 ```
 
+### Re-entering an active scope
+
+By default, entering a scope that is already active reuses the current context — you get back the same `InstanceContext` and the same instances. You can change this per call with the `reentry` argument of `scoped_context` / `ascoped_context`:
+
+* `reentry="reuse"` (default) — reuse the currently active context
+* `reentry="replace"` — open a fresh, isolated context that temporarily replaces the active one; on exit the previous context is restored
+* `reentry="forbid"` — raise `RuntimeError` if the scope is already active
+
+`reentry="replace"` requires the scope to be registered as `replaceable=True`. The fresh context has its own instance cache and still resolves parent and `singleton` dependencies, but it does **not** inherit instances from the replaced context. When it exits, only its own instances are cleaned up.
+
+```python
+from anydi import Container
+
+
+class TaskContext:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+
+container = Container()
+container.register_scope("task", replaceable=True)
+container.register(TaskContext, scope="task", from_context=True)
+
+with container.scoped_context("task") as outer:
+    outer.set(TaskContext, TaskContext(task_id="outer"))
+    assert container.resolve(TaskContext).task_id == "outer"
+
+    # Replace the active context with a fresh, isolated one
+    with container.scoped_context("task", reentry="replace") as inner:
+        inner.set(TaskContext, TaskContext(task_id="inner"))
+        assert container.resolve(TaskContext).task_id == "inner"
+
+    # The outer context is restored on exit
+    assert container.resolve(TaskContext).task_id == "outer"
+```
+
+This is useful when an inner unit of work needs its own isolated scope while an outer context of the same scope is still active.
+
+To access the currently active context without entering a new one, use `get_scoped_context(scope)` (raises `LookupError` if the scope is not active) or `try_get_scoped_context(scope)` (returns `None` instead).
+
 ### Best practices
 
 1. **Clear hierarchies**: Structure scopes to match your application logic (e.g., `request` → `transaction` → `batch`)
