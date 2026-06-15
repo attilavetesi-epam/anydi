@@ -39,6 +39,9 @@ from ._types import (
 T = TypeVar("T", bound=Any)
 P = ParamSpec("P")
 
+Reentry = Literal["forbid", "require", "allow"]
+OnReentry = Literal["reuse", "replace"]
+
 
 class Container:
     """AnyDI is a dependency injection container."""
@@ -56,6 +59,7 @@ class Container:
             "transient": ("transient", "singleton"),
             "singleton": ("singleton",),
         }
+        self._scope_replaceable: dict[str, bool] = {}
 
         self._resources: dict[str, list[Any]] = defaultdict(list)
         self._aliases: dict[Any, Any] = {}  # alias_type → canonical_type
@@ -171,18 +175,38 @@ class Container:
         await self._singleton_context.aclose()
 
     @contextlib.contextmanager
-    def scoped_context(self, scope: str) -> Iterator[InstanceContext]:
-        """Obtain a context manager for the request-scoped context."""
+    def scoped_context(
+        self, scope: str, *, reentry: Reentry = "allow", on_reentry: OnReentry = "reuse"
+    ) -> Iterator[InstanceContext]:
+        """Obtain a context manager for the specified scoped context.
+
+        Args:
+            scope: The scope name.
+            reentry: Whether this entry may or must be a re-entry of an
+                already-active same-scope context:
+                ``"allow"`` (default) permits either a first entry or a
+                re-entry; ``"require"`` raises RuntimeError unless the scope is
+                already active (this entry must be nested inside one);
+                ``"forbid"`` raises RuntimeError if the scope is already active
+                (this entry must be the first / root one).
+            on_reentry: What to do when a re-entry actually happens (the scope
+                is already active): ``"reuse"`` (default) yields the existing
+                context; ``"replace"`` opens a fresh, isolated context that
+                temporarily replaces the active one (requires the scope to be
+                registered with ``replaceable=True``). Ignored on a first entry.
+        """
         context_var = self._get_scoped_context_var(scope)
 
         # Check if context already exists (re-entering same scope)
-        context = context_var.get(None)
-        if context is not None:
-            # Reuse existing context, don't create a new one
-            yield context
-            return
+        existing_context = context_var.get(None)
+        if existing_context is not None:
+            if not self._reentry_creates_fresh(scope, reentry, on_reentry):
+                yield existing_context
+                return
+        elif reentry == "require":
+            raise self._require_active_error(scope)
 
-        # Create new context
+        # Create new context (first entry, or a replacing re-entry)
         context = InstanceContext()
         token = context_var.set(context)
 
@@ -192,23 +216,45 @@ class Container:
                 continue
             self.resolve(dependency_type)
 
-        with context:
-            yield context
+        try:
+            with context:
+                yield context
+        finally:
             context_var.reset(token)
 
     @contextlib.asynccontextmanager
-    async def ascoped_context(self, scope: str) -> AsyncIterator[InstanceContext]:
-        """Obtain a context manager for the specified scoped context."""
+    async def ascoped_context(
+        self, scope: str, *, reentry: Reentry = "allow", on_reentry: OnReentry = "reuse"
+    ) -> AsyncIterator[InstanceContext]:
+        """Obtain an async context manager for the specified scoped context.
+
+        Args:
+            scope: The scope name.
+            reentry: Whether this entry may or must be a re-entry of an
+                already-active same-scope context:
+                ``"allow"`` (default) permits either a first entry or a
+                re-entry; ``"require"`` raises RuntimeError unless the scope is
+                already active (this entry must be nested inside one);
+                ``"forbid"`` raises RuntimeError if the scope is already active
+                (this entry must be the first / root one).
+            on_reentry: What to do when a re-entry actually happens (the scope
+                is already active): ``"reuse"`` (default) yields the existing
+                context; ``"replace"`` opens a fresh, isolated context that
+                temporarily replaces the active one (requires the scope to be
+                registered with ``replaceable=True``). Ignored on a first entry.
+        """
         context_var = self._get_scoped_context_var(scope)
 
         # Check if context already exists (re-entering same scope)
-        context = context_var.get(None)
-        if context is not None:
-            # Reuse existing context, don't create a new one
-            yield context
-            return
+        existing_context = context_var.get(None)
+        if existing_context is not None:
+            if not self._reentry_creates_fresh(scope, reentry, on_reentry):
+                yield existing_context
+                return
+        elif reentry == "require":
+            raise self._require_active_error(scope)
 
-        # Create new context
+        # Create new context (first entry, or a replacing re-entry)
         context = InstanceContext()
         token = context_var.set(context)
 
@@ -218,9 +264,50 @@ class Container:
                 continue
             await self.aresolve(dependency_type)
 
-        async with context:
-            yield context
+        try:
+            async with context:
+                yield context
+        finally:
             context_var.reset(token)
+
+    def _reentry_creates_fresh(
+        self, scope: str, reentry: Reentry, on_reentry: OnReentry
+    ) -> bool:
+        """Decide how to re-enter an already-active scope.
+
+        Called only when a same-scope context is already active. Returns True if
+        a fresh, isolated context should replace the active one, or False if the
+        active context should be reused. Raises RuntimeError when re-entry is
+        forbidden (``reentry="forbid"``), or when ``on_reentry="replace"``
+        targets a scope not registered with ``replaceable=True``.
+        """
+        if reentry == "forbid":
+            raise RuntimeError(
+                f"The `{scope}` scope is already active and re-entry is "
+                f"forbidden (reentry='forbid'). Use "
+                f"`get_scoped_context('{scope}')` to read the active context, or "
+                f"pass reentry='allow'/'require' to re-enter it."
+            )
+        # reentry is "allow" or "require": a re-entry is permitted here, so
+        # on_reentry decides whether to share the active context or isolate.
+        if on_reentry == "reuse":
+            return False
+        # on_reentry == "replace"
+        if not self._scope_replaceable.get(scope, False):
+            raise RuntimeError(
+                f"The `{scope}` scope is not replaceable, so on_reentry='replace' "
+                f"is not allowed. Register it with "
+                f"`register_scope('{scope}', replaceable=True)`."
+            )
+        return True
+
+    def _require_active_error(self, scope: str) -> RuntimeError:
+        """Build the error for ``reentry="require"`` when the scope is inactive."""
+        return RuntimeError(
+            f"The `{scope}` scope requires an already-active context to re-enter "
+            f"(reentry='require'), but none is active. Enter the `{scope}` scope "
+            f"higher up first, or pass reentry='allow' to permit a first entry."
+        )
 
     @contextlib.contextmanager
     def request_context(self) -> Iterator[InstanceContext]:
@@ -233,6 +320,34 @@ class Container:
         """Obtain an async context manager for the request-scoped context."""
         async with self.ascoped_context("request") as context:
             yield context
+
+    def get_scoped_context(self, scope: str) -> InstanceContext:
+        """Get the currently active context for the specified scope.
+
+        Returns the InstanceContext that is currently active for the given
+        scope name. This is useful when you need to access or modify the
+        current scope's context without creating a new one.
+
+        Raises:
+            LookupError: If the scope context has not been started.
+            ValueError: If the scope is reserved or not registered.
+        """
+        return self._get_scoped_context(scope)
+
+    def try_get_scoped_context(self, scope: str) -> InstanceContext | None:
+        """Get the currently active context for the specified scope, or None.
+
+        Like :meth:`get_scoped_context`, but returns None when the scope has
+        not been entered instead of raising ``LookupError``. This is the
+        non-throwing variant for callers that branch on whether a scope is
+        currently active (e.g. optional dependencies that fall back to a
+        no-op when a deeper scope is not present).
+
+        Raises:
+            ValueError: If the scope is reserved or not registered.
+        """
+        scoped_context_var = self._get_scoped_context_var(scope)
+        return scoped_context_var.get(None)
 
     def _get_scoped_context(self, scope: str) -> InstanceContext:
         scoped_context_var = self._get_scoped_context_var(scope)
@@ -272,9 +387,26 @@ class Container:
     # == Scopes == #
 
     def register_scope(
-        self, scope: str, *, parents: Sequence[str] | None = None
+        self,
+        scope: str,
+        *,
+        parents: Sequence[str] | None = None,
+        replaceable: bool = False,
     ) -> None:
-        """Register a new scope with the specified parents."""
+        """Register a new scope with the specified parents.
+
+        Args:
+            scope: The name of the scope to register.
+            parents: Optional parent scopes that this scope can depend on.
+            replaceable: If True, the scope may be re-entered with a fresh,
+                isolated context via
+                ``scoped_context(scope, on_reentry="replace")``. The fresh
+                context has its own instance cache, can still resolve
+                dependencies from parent scopes (e.g. singleton), and on exit only
+                its own instances are cleaned up while the previously active
+                context is restored. If False (default), re-entering the scope
+                always reuses the active context.
+        """
         # Check if the scope is reserved
         if scope in ("transient", "singleton"):
             raise ValueError(
@@ -293,6 +425,7 @@ class Container:
 
         # Register the scope
         self._scopes[scope] = tuple({scope, "singleton"} | set(parents))
+        self._scope_replaceable[scope] = replaceable
 
     def has_scope(self, scope: str) -> bool:
         """Check if a scope is registered."""

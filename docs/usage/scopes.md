@@ -255,6 +255,64 @@ async def process_workflow() -> None:
             # Process workflow...
 ```
 
+### Re-entering an active scope
+
+Entering a scope that is already active is a *re-entry*. Two independent arguments of `scoped_context` / `ascoped_context` control it:
+
+**`reentry`** — an assertion about whether this entry may or must be a re-entry:
+
+* `reentry="allow"` (default) — either a first entry or a re-entry is fine
+* `reentry="require"` — raise `RuntimeError` unless the scope is already active (this entry *must* be nested inside an active one)
+* `reentry="forbid"` — raise `RuntimeError` if the scope is already active (this entry *must* be the first / root one)
+
+**`on_reentry`** — what to do *when a re-entry actually happens* (the scope is already active). Ignored on a first entry:
+
+* `on_reentry="reuse"` (default) — reuse the currently active context (same `InstanceContext`, same instances)
+* `on_reentry="replace"` — open a fresh, isolated context that temporarily replaces the active one; on exit the previous context is restored
+
+The defaults (`reentry="allow"`, `on_reentry="reuse"`) reuse the active context on re-entry — backwards compatible.
+
+`on_reentry="replace"` requires the scope to be registered as `replaceable=True`. The fresh context has its own instance cache and still resolves parent and `singleton` dependencies, but it does **not** inherit instances from the replaced context. When it exits, only its own instances are cleaned up.
+
+```python
+from anydi import Container
+
+
+class TaskContext:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+
+container = Container()
+container.register_scope("task", replaceable=True)
+container.register(TaskContext, scope="task", from_context=True)
+
+with container.scoped_context("task") as outer:
+    outer.set(TaskContext, TaskContext(task_id="outer"))
+    assert container.resolve(TaskContext).task_id == "outer"
+
+    # Replace the active context with a fresh, isolated one
+    with container.scoped_context("task", on_reentry="replace") as inner:
+        inner.set(TaskContext, TaskContext(task_id="inner"))
+        assert container.resolve(TaskContext).task_id == "inner"
+
+    # The outer context is restored on exit
+    assert container.resolve(TaskContext).task_id == "outer"
+```
+
+This is useful when an inner unit of work needs its own isolated scope while an outer context of the same scope is still active.
+
+#### Why the `reentry` assertions help
+
+`on_reentry` decides *behaviour*; `reentry` lets you **state the intent** of an entry and fail loudly when reality disagrees, instead of silently doing the wrong thing:
+
+* `reentry="forbid"` documents "this is the root entry for the scope." If the scope is unexpectedly already active (e.g. a caller was later wrapped in another entry of the same scope), you get a clear `RuntimeError` instead of quietly nesting and sharing a context you did not mean to share.
+* `reentry="require"` documents "this only makes sense nested inside an active parent." A stray first entry raises instead of silently starting a fresh root — handy for a child unit of work that must run inside a parent's context, e.g. `scoped_context("task", reentry="require", on_reentry="replace")`.
+
+Both default to permissive (`reentry="allow"`), so you opt in to the assertion only where the structure matters.
+
+To access the currently active context without entering a new one, use `get_scoped_context(scope)` (raises `LookupError` if the scope is not active) or `try_get_scoped_context(scope)` (returns `None` instead). Prefer these for *reading* the active context — only call `scoped_context` / `ascoped_context` when you genuinely need to **start** a scope.
+
 ### Best practices
 
 1. **Clear hierarchies**: Structure scopes to match your application logic (e.g., `request` → `transaction` → `batch`)
